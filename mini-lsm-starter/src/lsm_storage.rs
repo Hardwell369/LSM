@@ -1,13 +1,14 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
 use std::collections::HashMap;
-use std::ops::Bound;
+use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use bytes::Bytes;
+use nom::Err;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::block::Block;
@@ -15,6 +16,8 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::StorageIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
@@ -279,7 +282,23 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+        let state = self.state.read();
+        if let Some(value) = state.memtable.get(_key) {
+            if value.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(value));
+        }
+        // 从imm_memtable（由新到旧排序）中查找
+        for imm_memtable in state.imm_memtables.iter() {
+            if let Some(value) = imm_memtable.get(_key) {
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -289,12 +308,30 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+        if self.get_approximate_size() + _key.len() + _value.len() > self.options.target_sst_size {
+            // 添加唯一的写锁，防止其他线程同时执行freeze操作
+            let state_lock = self.state_lock.lock();
+            // 重新进行判定，因为在获取唯一锁的过程中，可能有其他线程已经执行了freeze操作
+            if self.get_approximate_size() + _key.len() + _value.len()
+                > self.options.target_sst_size
+            {
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+        // 确定不需要freeze memtable后，再次获取读锁，执行put操作
+        let state = self.state.read();
+        state.memtable.put(_key, _value)
+    }
+
+    fn get_approximate_size(&self) -> usize {
+        // 获取读锁，在读取完memtable的大小后，立即释放读锁，避免阻塞其他要执行freeze操作的线程
+        let state = self.state.read();
+        state.memtable.approximate_size()
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+        self.put(_key, &[])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -319,7 +356,15 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let new_mem_table = Arc::new(MemTable::create(self.next_sst_id()));
+        {
+            let mut state = self.state.write();
+            let mut state_copy = state.as_ref().clone();
+            let old_memtable = std::mem::replace(&mut state_copy.memtable, new_mem_table.clone());
+            state_copy.imm_memtables.insert(0, old_memtable);
+            *state = Arc::new(state_copy);
+        }
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
@@ -338,6 +383,23 @@ impl LsmStorageInner {
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        // 依据范围，获取memtable和imm_memtable的迭代器
+        let mut iters = Vec::new();
+        {
+            let state = self.state.read();
+            let memtable_iter = state.memtable.scan(_lower, _upper);
+            iters.push(Box::new(memtable_iter));
+            for imm_memtable in state.imm_memtables.iter() {
+                let imm_memtable_iter = imm_memtable.scan(_lower, _upper);
+                iters.push(Box::new(imm_memtable_iter));
+            }
+        }
+        let merge_iter = MergeIterator::create(iters);
+        let mut lsm_iter = LsmIterator::new(merge_iter)?;
+        // 起始需要跳过被删除的key（key不为空，但value为空）
+        if !lsm_iter.key().is_empty() && lsm_iter.value().is_empty() {
+            lsm_iter.next()?;
+        }
+        Ok(FusedIterator::new(lsm_iter))
     }
 }

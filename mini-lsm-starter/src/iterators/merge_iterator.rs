@@ -2,7 +2,9 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::cmp::{self};
+use std::collections::binary_heap::PeekMut;
 use std::collections::BinaryHeap;
+// use std::ops::Deref;
 
 use anyhow::Result;
 
@@ -45,7 +47,14 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut iters = iters
+            .into_iter()
+            .filter(|iter| iter.is_valid())
+            .enumerate()
+            .map(|(i, iter)| HeapWrapper(i, iter))
+            .collect::<BinaryHeap<_>>();
+        let current = iters.pop();
+        MergeIterator { iters, current }
     }
 }
 
@@ -55,18 +64,55 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        self.current.as_ref().unwrap().1.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current.as_ref().unwrap().1.value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.current.is_none() && self.current.as_ref().unwrap().1.is_valid()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let current = self.current.as_mut().unwrap();
+        let key = current.1.key();
+        // 移除与当前迭代器具有相同key的迭代器
+        // 每次对peek_mut对象进行操作后，heap会自动重新排序
+        while let Some(mut inner) = self.iters.peek_mut() {
+            if inner.1.key() != key {
+                break;
+            }
+            if let Err(e) = inner.1.next() {
+                PeekMut::pop(inner);
+                return Err(e);
+            }
+            if !inner.1.is_valid() {
+                PeekMut::pop(inner);
+            }
+        }
+
+        // 尝试移动当前迭代器
+        current.1.next()?;
+
+        // 如果当前迭代器不再有效，则将其替换为堆中的下一个迭代器
+        if !current.1.is_valid() {
+            *current = match self.iters.pop() {
+                Some(inner) => inner,
+                None => return Ok(()),
+            };
+        } else {
+            // 将当前迭代器与堆中的最小迭代器进行比较
+            // 如果当前迭代器大于最小迭代器，则交换两者
+            if let Some(mut iter) = self.iters.peek_mut() {
+                // 因为比较的结果是reverse的，所以这里使用大于号，但是实际上是小于号
+                if *iter > *current {
+                    std::mem::swap(&mut *iter, current);
+                }
+            }
+        }
+
+        Ok(())
     }
 }
