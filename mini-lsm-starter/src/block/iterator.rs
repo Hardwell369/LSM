@@ -48,7 +48,7 @@ impl BlockIterator {
 
     /// Returns the key of the current entry.
     pub fn key(&self) -> KeySlice {
-        KeySlice::from_slice(&self.key.raw_ref()[..])
+        KeySlice::from_slice(self.key.raw_ref())
     }
 
     /// Returns the value of the current entry.

@@ -1,6 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::path::Path;
 use std::sync::Arc;
 
@@ -47,12 +44,12 @@ impl SsTableBuilder {
             self.first_key = key.raw_ref().to_vec();
         }
 
-        self.last_key = key.raw_ref().to_vec();
-
         if !self.builder.add(key, value) {
             self.split_block();
             let _ = self.builder.add(key, value);
         }
+
+        self.last_key = key.raw_ref().to_vec();
     }
 
     /// Get the estimated size of the SSTable.
@@ -90,12 +87,14 @@ impl SsTableBuilder {
     }
 
     fn split_block(&mut self) {
+        let first_key = self.builder.first_key();
+        let last_key = self.builder.last_key();
         let block =
             std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size)).build();
         self.meta.push(BlockMeta {
             offset: self.data.len(),
-            first_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.first_key)),
-            last_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.last_key)),
+            first_key: KeyBytes::from_bytes(first_key),
+            last_key: KeyBytes::from_bytes(last_key),
         });
         self.data.extend_from_slice(&block.encode());
     }

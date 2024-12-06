@@ -72,7 +72,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     }
 
     fn is_valid(&self) -> bool {
-        !self.current.is_none() && self.current.as_ref().unwrap().1.is_valid()
+        self.current.is_some() && self.current.as_ref().unwrap().1.is_valid()
     }
 
     fn next(&mut self) -> Result<()> {

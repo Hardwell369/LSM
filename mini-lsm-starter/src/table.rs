@@ -1,6 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 pub(crate) mod bloom;
 mod builder;
 mod iterator;
@@ -175,19 +172,63 @@ impl SsTable {
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        if block_idx >= self.block_meta.len() {
+            return Err(anyhow::anyhow!("Block index out of range"));
+        }
+        let meta = &self.block_meta[block_idx];
+        let start_offset = meta.offset;
+        let mut end_offset = self.block_meta_offset;
+        if block_idx + 1 < self.block_meta.len() {
+            let next_meta = &self.block_meta[block_idx + 1];
+            end_offset = next_meta.offset;
+        }
+        let data = self
+            .file
+            .read(start_offset as u64, end_offset as u64 - start_offset as u64)?;
+        Ok(Arc::new(Block::decode(&data[..])))
     }
 
     /// Read a block from disk, with block cache. (Day 4)
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        // cache: (sst_id, block_idx) -> block
+        // try_get_with: 根据(sst_id, block_idx)查找缓存，如果没有则调用闭包函数，然后将函数运行的结果存入缓存
+        if let Some(cache) = &self.block_cache {
+            if let Ok(block) =
+                cache.try_get_with((self.sst_id(), block_idx), || self.read_block(block_idx))
+            {
+                return Ok(block);
+            }
+        }
+        let block = self.read_block(block_idx)?;
+        Ok(block)
     }
 
     /// Find the block that may contain `key`.
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
-        unimplemented!()
+        // 二分查找
+        let mut left = 0;
+        let mut right = self.block_meta.len() - 1;
+        while left < right {
+            let mid = (left + right) / 2;
+            let mid_key = &self.block_meta[mid].first_key;
+            if mid_key.as_key_slice() < key {
+                if key <= self.block_meta[mid].last_key.as_key_slice() {
+                    return mid;
+                }
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        let left_key = &self.block_meta[left].first_key;
+        let right_key = &self.block_meta[left].last_key;
+        if key > right_key.as_key_slice() {
+            left + 1
+        } else {
+            left
+        }
     }
 
     /// Get number of data blocks.
