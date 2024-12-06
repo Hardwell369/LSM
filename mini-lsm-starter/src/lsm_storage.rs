@@ -16,13 +16,15 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
-use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::StorageIterator;
+use crate::iterators::{merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator};
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
 use crate::table::SsTable;
+use crate::table::SsTableIterator;
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -282,20 +284,47 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        let state = self.state.read();
-        if let Some(value) = state.memtable.get(_key) {
-            if value.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(value));
-        }
-        // 从imm_memtable（由新到旧排序）中查找
-        for imm_memtable in state.imm_memtables.iter() {
-            if let Some(value) = imm_memtable.get(_key) {
+        // 从内存中查找
+        {
+            let state = self.state.read();
+            // 从memtable中查找
+            if let Some(value) = state.memtable.get(_key) {
                 if value.is_empty() {
                     return Ok(None);
                 }
                 return Ok(Some(value));
+            }
+            // 从imm_memtable（由新到旧排序）中查找
+            for imm_memtable in state.imm_memtables.iter() {
+                if let Some(value) = imm_memtable.get(_key) {
+                    if value.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(value));
+                }
+            }
+        }
+        // 从磁盘中查找
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+        // 从l0_sstables（由新到旧排序）中查找
+        for sst_id in snapshot.l0_sstables.iter() {
+            let sst = snapshot.sstables.get(sst_id).unwrap().clone();
+            let first_key = sst.first_key().as_key_slice().raw_ref();
+            let last_key = sst.last_key().as_key_slice().raw_ref();
+            // 判断用户指定的key是否在sstable的范围内
+            // 只有在范围内才进一步去寻找该key
+            if _key >= first_key && _key <= last_key {
+                let sst_iter =
+                    SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(_key))?;
+                if sst_iter.is_valid() && sst_iter.key().raw_ref() == _key {
+                    if sst_iter.value().is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(Bytes::copy_from_slice(sst_iter.value())));
+                }
             }
         }
         Ok(None)
@@ -384,22 +413,80 @@ impl LsmStorageInner {
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
         // 依据范围，获取memtable和imm_memtable的迭代器
-        let mut iters = Vec::new();
+        let mut mem_iters = Vec::new();
         {
             let state = self.state.read();
             let memtable_iter = state.memtable.scan(_lower, _upper);
-            iters.push(Box::new(memtable_iter));
+            mem_iters.push(Box::new(memtable_iter));
             for imm_memtable in state.imm_memtables.iter() {
                 let imm_memtable_iter = imm_memtable.scan(_lower, _upper);
-                iters.push(Box::new(imm_memtable_iter));
+                mem_iters.push(Box::new(imm_memtable_iter));
             }
         }
-        let merge_iter = MergeIterator::create(iters);
-        let mut lsm_iter = LsmIterator::new(merge_iter)?;
-        // 起始需要跳过被删除的key（key不为空，但value为空）
-        if !lsm_iter.key().is_empty() && lsm_iter.value().is_empty() {
-            lsm_iter.next()?;
+
+        // 依据范围，获取l0_sstables的迭代器
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+        let mut sst_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        for sst_id in snapshot.l0_sstables.iter() {
+            // 判断每一个sstable是否与用户指定的范围有交集
+            // 如果没有交集，则不需要创建迭代器，直接跳过
+            // 如果有交集，则创建迭代器，且根据用户指定的范围进行seek操作
+            let sst = snapshot.sstables.get(sst_id).unwrap().clone();
+            if self.range_overlap(
+                _lower,
+                _upper,
+                sst.first_key().as_key_slice(),
+                sst.last_key().as_key_slice(),
+            ) {
+                let sst_iter = match _lower {
+                    Bound::Included(key) => {
+                        SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))?
+                    }
+                    Bound::Excluded(key) => {
+                        let mut iter = SsTableIterator::create_and_seek_to_key(
+                            sst,
+                            KeySlice::from_slice(key),
+                        )?;
+                        if iter.is_valid() && iter.key().raw_ref() == key {
+                            iter.next()?;
+                        }
+                        iter
+                    }
+                    Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sst)?,
+                };
+                sst_iters.push(Box::new(sst_iter));
+            }
         }
+
+        let memtable_merge_iter = MergeIterator::create(mem_iters);
+        let sst_merge_iter = MergeIterator::create(sst_iters);
+        let lsm_inner_iter = TwoMergeIterator::create(memtable_merge_iter, sst_merge_iter)?;
+        let end_bound = _upper.map(|b| Bytes::copy_from_slice(b));
+        let lsm_iter = LsmIterator::new(lsm_inner_iter, end_bound)?;
         Ok(FusedIterator::new(lsm_iter))
+    }
+
+    // 判断用户指定的范围（lower, upper）是否与Sstable的范围是否有交集
+    fn range_overlap(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        sst_first_key: KeySlice,
+        sst_last_key: KeySlice,
+    ) -> bool {
+        match upper {
+            Bound::Excluded(key) if key <= sst_first_key.raw_ref() => return false,
+            Bound::Included(key) if key < sst_first_key.raw_ref() => return false,
+            _ => {}
+        }
+        match lower {
+            Bound::Excluded(key) if key >= sst_last_key.raw_ref() => return false,
+            Bound::Included(key) if key > sst_last_key.raw_ref() => return false,
+            _ => {}
+        }
+        true
     }
 }

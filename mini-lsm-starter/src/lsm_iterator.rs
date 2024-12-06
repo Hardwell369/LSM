@@ -1,23 +1,37 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
+use std::ops::Bound;
 
 use anyhow::Result;
+use bytes::Bytes;
 
 use crate::{
-    iterators::{merge_iterator::MergeIterator, StorageIterator},
+    iterators::{
+        merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator, StorageIterator,
+    },
     mem_table::MemTableIterator,
+    table::SsTableIterator,
 };
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the tutorial for multiple times.
-type LsmIteratorInner = MergeIterator<MemTableIterator>;
+// type LsmIteratorInner = MergeIterator<MemTableIterator>;
+type LsmIteratorInner =
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
+    end_bound: Bound<Bytes>,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
-        Ok(Self { inner: iter })
+    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
+        let mut lsm_iter = Self {
+            inner: iter,
+            end_bound,
+        };
+        // 起始需要跳过被删除的key（key不为空，但value为空）
+        if lsm_iter.is_valid() && lsm_iter.value().is_empty() {
+            lsm_iter.next()?;
+        }
+        Ok(lsm_iter)
     }
 }
 
@@ -25,11 +39,20 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        self.inner.is_valid()
+        if !self.inner.is_valid() {
+            return false;
+        }
+        // 判断是否超出上界
+        let is_valid = match &self.end_bound {
+            Bound::Included(bound) => self.key() <= bound.as_ref(),
+            Bound::Excluded(bound) => self.key() < bound.as_ref(),
+            Bound::Unbounded => true,
+        };
+        is_valid
     }
 
     fn key(&self) -> &[u8] {
-        self.inner.key().into_inner()
+        self.inner.key().raw_ref()
     }
 
     fn value(&self) -> &[u8] {
@@ -38,11 +61,11 @@ impl StorageIterator for LsmIterator {
 
     fn next(&mut self) -> Result<()> {
         // 需要跳过被删除的 key
-        let mut res = self.inner.next();
-        while res.is_ok() && !self.key().is_empty() && self.value().is_empty() {
-            res = self.next();
+        self.inner.next()?;
+        while self.inner.is_valid() && !self.key().is_empty() && self.value().is_empty() {
+            self.inner.next()?;
         }
-        res
+        Ok(())
     }
 }
 

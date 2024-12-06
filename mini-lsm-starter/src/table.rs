@@ -6,7 +6,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 pub use builder::SsTableBuilder;
 use bytes::{Buf, BufMut};
 pub use iterator::SsTableIterator;
@@ -193,7 +193,7 @@ impl SsTable {
         // cache: (sst_id, block_idx) -> block
         // try_get_with: 根据(sst_id, block_idx)查找缓存，如果没有则调用闭包函数，然后将函数运行的结果存入缓存
         if let Some(cache) = &self.block_cache {
-            if let Ok(block) =
+            if let std::result::Result::Ok(block) =
                 cache.try_get_with((self.sst_id(), block_idx), || self.read_block(block_idx))
             {
                 return Ok(block);
@@ -222,7 +222,7 @@ impl SsTable {
                 right = mid;
             }
         }
-        let left_key = &self.block_meta[left].first_key;
+        // let left_key = &self.block_meta[left].first_key;
         let right_key = &self.block_meta[left].last_key;
         if key > right_key.as_key_slice() {
             left + 1
