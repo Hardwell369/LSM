@@ -1,10 +1,13 @@
+use core::hash;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::{BufMut, Bytes};
 
-use super::{BlockMeta, SsTable};
+use self::bloom::Bloom;
+
+use super::{bloom, BlockMeta, SsTable};
 use crate::{
     block::BlockBuilder,
     key::{KeyBytes, KeySlice},
@@ -19,6 +22,7 @@ pub struct SsTableBuilder {
     last_key: Vec<u8>,
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
+    hash_keys: Vec<u32>, // hash keys for bloom filter
     block_size: usize,
 }
 
@@ -31,6 +35,7 @@ impl SsTableBuilder {
             last_key: vec![],
             data: vec![],
             meta: vec![],
+            hash_keys: vec![],
             block_size,
         }
     }
@@ -50,6 +55,7 @@ impl SsTableBuilder {
         }
 
         self.last_key = key.raw_ref().to_vec();
+        self.hash_keys.push(farmhash::fingerprint32(key.raw_ref()));
     }
 
     /// Get the estimated size of the SSTable.
@@ -67,12 +73,29 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
-        self.split_block();
+        // Split the last block
+        if !self.builder.is_empty() {
+            self.split_block();
+        }
+        // SST File: data blocks | meta blocks | block meta offset(u32) | bloom filter | bloom filter offset(u32)
+        /* data blocks */
         let mut buf = self.data;
+        /* meta blocks */
         let block_meta_offset = buf.len();
         BlockMeta::encode_block_meta(&self.meta, &mut buf);
         buf.put_u32(block_meta_offset as u32);
+        /* bloom filter */
+        let bloom_filter_offset = buf.len();
+        let bloom_filter = bloom::Bloom::build_from_key_hashes(
+            self.hash_keys.as_slice(),
+            Bloom::bloom_bits_per_key(self.hash_keys.len(), 0.01),
+        );
+        bloom_filter.encode(&mut buf);
+        buf.put_u32(bloom_filter_offset as u32);
+
+        /* write to disk and generate SST file */
         let file = FileObject::create(path.as_ref(), buf)?;
+
         Ok(SsTable {
             file,
             block_meta: self.meta,
@@ -81,7 +104,7 @@ impl SsTableBuilder {
             block_cache,
             first_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.first_key)),
             last_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.last_key)),
-            bloom: None,
+            bloom: Some(bloom_filter),
             max_ts: 0,
         })
     }

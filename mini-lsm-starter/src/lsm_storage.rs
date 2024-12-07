@@ -315,10 +315,19 @@ impl LsmStorageInner {
         // 从l0_sstables（由新到旧排序）中查找
         for sst_id in snapshot.l0_sstables.iter() {
             let sst = snapshot.sstables.get(sst_id).unwrap().clone();
+            // 讨论点：bloom filter的效果在大多数情况下可能会优于条件判断 “_key >= first_key && _key <= last_key”
+            // 借助 bloom filter 过滤 一定不包含指定 key 的 SST
+            if sst.bloom.is_some()
+                && !sst
+                    .bloom
+                    .as_ref()
+                    .unwrap()
+                    .may_contain(farmhash::fingerprint32(_key))
+            {
+                continue;
+            }
             let first_key = sst.first_key().as_key_slice().raw_ref();
             let last_key = sst.last_key().as_key_slice().raw_ref();
-            // 判断用户指定的key是否在sstable的范围内
-            // 只有在范围内才进一步去寻找该key
             if _key >= first_key && _key <= last_key {
                 let sst_iter =
                     SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(_key))?;

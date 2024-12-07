@@ -1,5 +1,7 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::ops::Deref;
+
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -80,6 +82,15 @@ impl Bloom {
         filter.resize(nbytes, 0);
 
         // TODO: build the bloom filter
+        for h in keys {
+            let mut h = *h;
+            let delta = h.rotate_left(15);
+            for _ in 0..k {
+                let idx = h as usize % nbits;
+                filter.set_bit(idx, true);
+                h = h.wrapping_add(delta);
+            }
+        }
 
         Self {
             filter: filter.freeze(),
@@ -97,7 +108,14 @@ impl Bloom {
             let delta = h.rotate_left(15);
 
             // TODO: probe the bloom filter
-
+            let mut h = h;
+            for _ in 0..self.k {
+                let idx = h as usize % nbits;
+                if !self.filter.get_bit(idx) {
+                    return false;
+                }
+                h = h.wrapping_add(delta);
+            }
             true
         }
     }
