@@ -206,6 +206,8 @@ impl SsTable {
     /// Find the block that may contain `key`.
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
+    // 该函数可能会返回一个不存在的索引，该索引通常是最后一个数据块的索引+1
+    // 在调用时，需要在外部判断是否越界
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
         // 二分查找
         let mut left = 0;

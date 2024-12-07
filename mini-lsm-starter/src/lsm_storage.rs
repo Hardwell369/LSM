@@ -21,10 +21,10 @@ use crate::iterators::{merge_iterator::MergeIterator, two_merge_iterator::TwoMer
 use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
 use crate::table::SsTableIterator;
+use crate::table::{SsTable, SsTableBuilder};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -159,7 +159,11 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        // 等待 flush 线程完成工作
+        if let Some(handle) = self.flush_thread.lock().take() {
+            handle.join().unwrap();
+        }
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -284,31 +288,30 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        // 从内存中查找
-        {
-            let state = self.state.read();
-            // 从memtable中查找
-            if let Some(value) = state.memtable.get(_key) {
+        // 克隆数据快照，避免长时间占用读锁
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+        /* 从内存中查找 */
+        // 从memtable中查找
+        if let Some(value) = snapshot.memtable.get(_key) {
+            if value.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(value));
+        }
+        // 从imm_memtable（由新到旧排序）中查找
+        for imm_memtable in snapshot.imm_memtables.iter() {
+            if let Some(value) = imm_memtable.get(_key) {
                 if value.is_empty() {
                     return Ok(None);
                 }
                 return Ok(Some(value));
             }
-            // 从imm_memtable（由新到旧排序）中查找
-            for imm_memtable in state.imm_memtables.iter() {
-                if let Some(value) = imm_memtable.get(_key) {
-                    if value.is_empty() {
-                        return Ok(None);
-                    }
-                    return Ok(Some(value));
-                }
-            }
         }
-        // 从磁盘中查找
-        let snapshot = {
-            let guard = self.state.read();
-            Arc::clone(&guard)
-        };
+
+        /* 从磁盘中查找 */
         // 从l0_sstables（由新到旧排序）中查找
         for sst_id in snapshot.l0_sstables.iter() {
             let sst = snapshot.sstables.get(sst_id).unwrap().clone();
@@ -397,8 +400,38 @@ impl LsmStorageInner {
     }
 
     /// Force flush the earliest-created immutable memtable to disk
+    // 该函数目前可能存在问题
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+
+        // 获取最早创建的imm_memtable
+        let imm_memtable = {
+            let state = self.state.read();
+            state.imm_memtables.last().unwrap().clone()
+        };
+
+        // 创建SST文件
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+        imm_memtable.flush(&mut sst_builder)?;
+        let sst_id = imm_memtable.id();
+        let sst_path = self.path_of_sst(sst_id);
+        let block_cache = Some(self.block_cache.clone());
+        let sst = sst_builder.build(sst_id, block_cache, sst_path)?;
+
+        // 将imm_memtable从imm_memtables_list中移除，同时将SST文件写入磁盘L0 SSTs
+        {
+            let mut snapshot = self.state.write();
+            let mut state_copy = snapshot.as_ref().clone();
+            // // 如果在获取写锁的过程中，imm_memtable已经被其他线程flush到磁盘，则直接返回
+            // if imm_memtable.id() != state_copy.imm_memtables.last().unwrap().id() {
+            //     return Ok(());
+            // }
+            state_copy.imm_memtables.pop();
+            state_copy.sstables.insert(sst_id, Arc::new(sst));
+            state_copy.l0_sstables.insert(0, sst_id);
+            *snapshot = Arc::new(state_copy);
+        }
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -412,23 +445,22 @@ impl LsmStorageInner {
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        // 依据范围，获取memtable和imm_memtable的迭代器
-        let mut mem_iters = Vec::new();
-        {
-            let state = self.state.read();
-            let memtable_iter = state.memtable.scan(_lower, _upper);
-            mem_iters.push(Box::new(memtable_iter));
-            for imm_memtable in state.imm_memtables.iter() {
-                let imm_memtable_iter = imm_memtable.scan(_lower, _upper);
-                mem_iters.push(Box::new(imm_memtable_iter));
-            }
-        }
-
-        // 依据范围，获取l0_sstables的迭代器
+        // 获取读锁，在对数据进行克隆后立即释放读锁，之后便针对数据副本进行读取、查找操作
+        // 该操作是为了尽快释放读锁，避免阻塞其他线程
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
         };
+        // 依据范围，获取memtable和imm_memtable的迭代器
+        let mut mem_iters = Vec::new();
+        let memtable_iter = snapshot.memtable.scan(_lower, _upper);
+        mem_iters.push(Box::new(memtable_iter));
+        for imm_memtable in snapshot.imm_memtables.iter() {
+            let imm_memtable_iter = imm_memtable.scan(_lower, _upper);
+            mem_iters.push(Box::new(imm_memtable_iter));
+        }
+
+        // 依据范围，获取l0_sstables的迭代器
         let mut sst_iters = Vec::with_capacity(snapshot.l0_sstables.len());
         for sst_id in snapshot.l0_sstables.iter() {
             // 判断每一个sstable是否与用户指定的范围有交集
@@ -461,10 +493,11 @@ impl LsmStorageInner {
             }
         }
 
+        // 构造LsmIterator
         let memtable_merge_iter = MergeIterator::create(mem_iters);
         let sst_merge_iter = MergeIterator::create(sst_iters);
         let lsm_inner_iter = TwoMergeIterator::create(memtable_merge_iter, sst_merge_iter)?;
-        let end_bound = _upper.map(|b| Bytes::copy_from_slice(b));
+        let end_bound = map_bound(_upper);
         let lsm_iter = LsmIterator::new(lsm_inner_iter, end_bound)?;
         Ok(FusedIterator::new(lsm_iter))
     }
