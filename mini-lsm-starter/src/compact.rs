@@ -15,6 +15,7 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::StorageIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
@@ -124,24 +125,57 @@ impl LsmStorageInner {
                     state.clone()
                 };
                 let mut result = Vec::new();
-                // create iterators for all sstables in L0 and L1
-                let mut iters = Vec::with_capacity(l0_sstables.len() + l1_sstables.len());
-                for sst_id in l0_sstables.iter().chain(l1_sstables.iter()) {
-                    iters.push(Box::new(SsTableIterator::create_and_seek_to_first(
+                // create merge iterator for L0
+                let mut l0_iters = Vec::with_capacity(l0_sstables.len());
+                for sst_id in l0_sstables.iter() {
+                    l0_iters.push(Box::new(SsTableIterator::create_and_seek_to_first(
                         snapshot.sstables.get(sst_id).unwrap().clone(),
                     )?));
                 }
-                // use merge iterator to merge all sstables
-                let mut merged_iter = MergeIterator::create(iters);
+                let mut l0_merge_iter = MergeIterator::create(l0_iters);
+                // create concat iterator for L1
+                let mut l1_ssts = Vec::with_capacity(l1_sstables.len());
+                for sst_id in l1_sstables.iter() {
+                    l1_ssts.push(snapshot.sstables.get(sst_id).unwrap().clone());
+                }
+                let mut l1_concat_iter = SstConcatIterator::create_and_seek_to_first(l1_ssts)?;
+                // merge L0 and L1
                 let mut builder = SsTableBuilder::new(self.options.block_size);
-                while merged_iter.is_valid() {
-                    let key = merged_iter.key();
-                    let value = merged_iter.value();
-                    // delete key if value is empty
-                    if !value.is_empty() {
-                        builder.add(key, value);
+                while l0_merge_iter.is_valid() || l1_concat_iter.is_valid() {
+                    if l0_merge_iter.is_valid() && l1_concat_iter.is_valid() {
+                        if l0_merge_iter.key() <= l1_concat_iter.key() {
+                            let key = l0_merge_iter.key();
+                            let value = l0_merge_iter.value();
+                            if !value.is_empty() {
+                                builder.add(key, value);
+                            }
+                            if l0_merge_iter.key() == l1_concat_iter.key() {
+                                l1_concat_iter.next()?;
+                            }
+                            l0_merge_iter.next()?;
+                        } else {
+                            let key = l1_concat_iter.key();
+                            let value = l1_concat_iter.value();
+                            if !value.is_empty() {
+                                builder.add(key, value);
+                            }
+                            l1_concat_iter.next()?;
+                        }
+                    } else if l0_merge_iter.is_valid() {
+                        let key = l0_merge_iter.key();
+                        let value = l0_merge_iter.value();
+                        if !value.is_empty() {
+                            builder.add(key, value);
+                        }
+                        l0_merge_iter.next()?;
+                    } else {
+                        let key = l1_concat_iter.key();
+                        let value = l1_concat_iter.value();
+                        if !value.is_empty() {
+                            builder.add(key, value);
+                        }
+                        l1_concat_iter.next()?;
                     }
-                    merged_iter.next().unwrap();
                     // if the builder is full, write to a new sstable
                     if builder.estimated_size() >= self.options.target_sst_size {
                         let new_sst_id = self.next_sst_id();
@@ -151,7 +185,7 @@ impl LsmStorageInner {
                         builder = SsTableBuilder::new(self.options.block_size);
                     }
                 }
-                // write the last sstable
+                // write the remaining data to a new sstable
                 let new_sst_id = self.next_sst_id();
                 let new_sst = builder.build(new_sst_id, None, self.path_of_sst(new_sst_id))?;
                 result.push(Arc::new(new_sst));

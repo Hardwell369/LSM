@@ -530,11 +530,24 @@ impl LsmStorageInner {
         for sst_id in snapshot.levels[0].1.iter() {
             l1_ssts.push(snapshot.sstables.get(sst_id).unwrap().clone());
         }
+        let l1_concat_iter = match _lower {
+            Bound::Included(key) => {
+                SstConcatIterator::create_and_seek_to_key(l1_ssts, KeySlice::from_slice(key))?
+            }
+            Bound::Excluded(key) => {
+                let mut iter =
+                    SstConcatIterator::create_and_seek_to_key(l1_ssts, KeySlice::from_slice(key))?;
+                if iter.is_valid() && iter.key().raw_ref() == key {
+                    iter.next()?;
+                }
+                iter
+            }
+            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(l1_ssts)?,
+        };
 
         // 构造LsmIterator
         let memtable_merge_iter = MergeIterator::create(mem_iters);
         let l0_sst_merge_iter = MergeIterator::create(l0_sst_iters);
-        let l1_concat_iter = SstConcatIterator::create_and_seek_to_first(l1_ssts)?;
         let mem_l0_iter = TwoMergeIterator::create(memtable_merge_iter, l0_sst_merge_iter)?;
         let lsm_inner_iter = TwoMergeIterator::create(mem_l0_iter, l1_concat_iter)?;
         let end_bound = map_bound(_upper);
