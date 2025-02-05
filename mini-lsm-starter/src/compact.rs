@@ -7,7 +7,7 @@ mod tiered;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
 use serde::{Deserialize, Serialize};
 pub use simple_leveled::{
@@ -15,8 +15,10 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::StorageIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CompactionTask {
@@ -109,11 +111,91 @@ pub enum CompactionOptions {
 
 impl LsmStorageInner {
     fn compact(&self, _task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
-        unimplemented!()
+        match _task {
+            CompactionTask::Leveled(task) => unimplemented!(),
+            CompactionTask::Tiered(task) => unimplemented!(),
+            CompactionTask::Simple(task) => unimplemented!(),
+            CompactionTask::ForceFullCompaction {
+                l0_sstables,
+                l1_sstables,
+            } => {
+                let snapshot = {
+                    let state = self.state.read();
+                    state.clone()
+                };
+                let mut result = Vec::new();
+                // create iterators for all sstables in L0 and L1
+                let mut iters = Vec::with_capacity(l0_sstables.len() + l1_sstables.len());
+                for sst_id in l0_sstables.iter().chain(l1_sstables.iter()) {
+                    iters.push(Box::new(SsTableIterator::create_and_seek_to_first(
+                        snapshot.sstables.get(sst_id).unwrap().clone(),
+                    )?));
+                }
+                // use merge iterator to merge all sstables
+                let mut merged_iter = MergeIterator::create(iters);
+                let mut builder = SsTableBuilder::new(self.options.block_size);
+                while merged_iter.is_valid() {
+                    let key = merged_iter.key();
+                    let value = merged_iter.value();
+                    // delete key if value is empty
+                    if !value.is_empty() {
+                        builder.add(key, value);
+                    }
+                    merged_iter.next().unwrap();
+                    // if the builder is full, write to a new sstable
+                    if builder.estimated_size() >= self.options.target_sst_size {
+                        let new_sst_id = self.next_sst_id();
+                        let new_sst =
+                            builder.build(new_sst_id, None, self.path_of_sst(new_sst_id))?;
+                        result.push(Arc::new(new_sst));
+                        builder = SsTableBuilder::new(self.options.block_size);
+                    }
+                }
+                // write the last sstable
+                let new_sst_id = self.next_sst_id();
+                let new_sst = builder.build(new_sst_id, None, self.path_of_sst(new_sst_id))?;
+                result.push(Arc::new(new_sst));
+                Ok(result)
+            }
+        }
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
-        unimplemented!()
+        let snapshot = {
+            let state = self.state.read();
+            state.clone()
+        };
+
+        // Generate a compaction task that compacts all SSTables in L0 and L1
+        let l0_ssts = snapshot.l0_sstables.clone();
+        let l1_ssts = snapshot.levels[0].1.clone();
+        let compact_task = CompactionTask::ForceFullCompaction {
+            l0_sstables: l0_ssts.clone(),
+            l1_sstables: l1_ssts.clone(),
+        };
+
+        // do compaction
+        let new_ssts = self.compact(&compact_task)?;
+
+        {
+            let mut state = self.state.write();
+            let mut snapshot = state.as_ref().clone();
+
+            // Remove all SSTables in L0 and L1
+            for sst in l0_ssts.iter().chain(l1_ssts.iter()) {
+                snapshot.sstables.remove(sst);
+            }
+            snapshot.l0_sstables.clear();
+            snapshot.levels[0].1.clear();
+
+            // Add new SSTables to L1, and insert into sstables
+            for sst in new_ssts {
+                snapshot.levels[0].1.push(sst.sst_id());
+                snapshot.sstables.insert(sst.sst_id(), sst);
+            }
+            *state = Arc::new(snapshot);
+        }
+        Ok(())
     }
 
     fn trigger_compaction(&self) -> Result<()> {

@@ -16,6 +16,7 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::StorageIterator;
 use crate::iterators::{merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator};
 use crate::key::KeySlice;
@@ -316,7 +317,7 @@ impl LsmStorageInner {
         for sst_id in snapshot.l0_sstables.iter() {
             let sst = snapshot.sstables.get(sst_id).unwrap().clone();
             // 讨论点：bloom filter的效果在大多数情况下可能会优于条件判断 “_key >= first_key && _key <= last_key”
-            // 借助 bloom filter 过滤 一定不包含指定 key 的 SST
+            // 借助 bloom filter 过滤一定不包含指定 key 的 SST
             if sst.bloom.is_some()
                 && !sst
                     .bloom
@@ -338,6 +339,29 @@ impl LsmStorageInner {
                     return Ok(Some(Bytes::copy_from_slice(sst_iter.value())));
                 }
             }
+        }
+        // 从l1_levels（sorted runs）中查找
+        let mut l1_ssts = Vec::new();
+        for sst_id in snapshot.levels[0].1.iter() {
+            let sst = snapshot.sstables.get(sst_id).unwrap().clone();
+            if sst.bloom.is_some()
+                && !sst
+                    .bloom
+                    .as_ref()
+                    .unwrap()
+                    .may_contain(farmhash::fingerprint32(_key))
+            {
+                continue;
+            }
+            l1_ssts.push(sst);
+        }
+        let l1_iter =
+            SstConcatIterator::create_and_seek_to_key(l1_ssts, KeySlice::from_slice(_key))?;
+        if l1_iter.is_valid() && l1_iter.key().raw_ref() == _key {
+            if l1_iter.value().is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(Bytes::copy_from_slice(l1_iter.value())));
         }
         Ok(None)
     }
@@ -470,7 +494,7 @@ impl LsmStorageInner {
         }
 
         // 依据范围，获取l0_sstables的迭代器
-        let mut sst_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        let mut l0_sst_iters = Vec::with_capacity(snapshot.l0_sstables.len());
         for sst_id in snapshot.l0_sstables.iter() {
             // 判断每一个sstable是否与用户指定的范围有交集
             // 如果没有交集，则不需要创建迭代器，直接跳过
@@ -498,14 +522,21 @@ impl LsmStorageInner {
                     }
                     Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sst)?,
                 };
-                sst_iters.push(Box::new(sst_iter));
+                l0_sst_iters.push(Box::new(sst_iter));
             }
+        }
+        // 获取l1_levels的迭代器
+        let mut l1_ssts = Vec::with_capacity(snapshot.levels[0].1.len());
+        for sst_id in snapshot.levels[0].1.iter() {
+            l1_ssts.push(snapshot.sstables.get(sst_id).unwrap().clone());
         }
 
         // 构造LsmIterator
         let memtable_merge_iter = MergeIterator::create(mem_iters);
-        let sst_merge_iter = MergeIterator::create(sst_iters);
-        let lsm_inner_iter = TwoMergeIterator::create(memtable_merge_iter, sst_merge_iter)?;
+        let l0_sst_merge_iter = MergeIterator::create(l0_sst_iters);
+        let l1_concat_iter = SstConcatIterator::create_and_seek_to_first(l1_ssts)?;
+        let mem_l0_iter = TwoMergeIterator::create(memtable_merge_iter, l0_sst_merge_iter)?;
+        let lsm_inner_iter = TwoMergeIterator::create(mem_l0_iter, l1_concat_iter)?;
         let end_bound = map_bound(_upper);
         let lsm_iter = LsmIterator::new(lsm_inner_iter, end_bound)?;
         Ok(FusedIterator::new(lsm_iter))
