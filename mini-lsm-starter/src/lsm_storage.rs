@@ -340,28 +340,30 @@ impl LsmStorageInner {
                 }
             }
         }
-        // 从l1_levels（sorted runs）中查找
-        let mut l1_ssts = Vec::new();
-        for sst_id in snapshot.levels[0].1.iter() {
-            let sst = snapshot.sstables.get(sst_id).unwrap().clone();
-            if sst.bloom.is_some()
-                && !sst
-                    .bloom
-                    .as_ref()
-                    .unwrap()
-                    .may_contain(farmhash::fingerprint32(_key))
-            {
-                continue;
+        // 从levels（sorted runs）中查找
+        for (_, level) in snapshot.levels.iter() {
+            let mut ssts = Vec::new();
+            for sst_id in level.iter() {
+                let sst = snapshot.sstables.get(sst_id).unwrap().clone();
+                if sst.bloom.is_some()
+                    && !sst
+                        .bloom
+                        .as_ref()
+                        .unwrap()
+                        .may_contain(farmhash::fingerprint32(_key))
+                {
+                    continue;
+                }
+                ssts.push(sst);
             }
-            l1_ssts.push(sst);
-        }
-        let l1_iter =
-            SstConcatIterator::create_and_seek_to_key(l1_ssts, KeySlice::from_slice(_key))?;
-        if l1_iter.is_valid() && l1_iter.key().raw_ref() == _key {
-            if l1_iter.value().is_empty() {
-                return Ok(None);
+            let level_iter =
+                SstConcatIterator::create_and_seek_to_key(ssts, KeySlice::from_slice(_key))?;
+            if level_iter.is_valid() && level_iter.key().raw_ref() == _key {
+                if level_iter.value().is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(Bytes::copy_from_slice(level_iter.value())));
             }
-            return Ok(Some(Bytes::copy_from_slice(l1_iter.value())));
         }
         Ok(None)
     }
@@ -525,31 +527,39 @@ impl LsmStorageInner {
                 l0_sst_iters.push(Box::new(sst_iter));
             }
         }
-        // 获取l1_levels的迭代器
-        let mut l1_ssts = Vec::with_capacity(snapshot.levels[0].1.len());
-        for sst_id in snapshot.levels[0].1.iter() {
-            l1_ssts.push(snapshot.sstables.get(sst_id).unwrap().clone());
-        }
-        let l1_concat_iter = match _lower {
-            Bound::Included(key) => {
-                SstConcatIterator::create_and_seek_to_key(l1_ssts, KeySlice::from_slice(key))?
+        // 获取levels的迭代器
+        let mut level_concat_iters = Vec::with_capacity(snapshot.levels.len());
+        for (_, level) in snapshot.levels.iter() {
+            let mut level_ssts = Vec::with_capacity(level.len());
+            for sst_id in level.iter() {
+                level_ssts.push(snapshot.sstables.get(sst_id).unwrap().clone());
             }
-            Bound::Excluded(key) => {
-                let mut iter =
-                    SstConcatIterator::create_and_seek_to_key(l1_ssts, KeySlice::from_slice(key))?;
-                if iter.is_valid() && iter.key().raw_ref() == key {
-                    iter.next()?;
+            let level_concat_iter = match _lower {
+                Bound::Included(key) => SstConcatIterator::create_and_seek_to_key(
+                    level_ssts,
+                    KeySlice::from_slice(key),
+                )?,
+                Bound::Excluded(key) => {
+                    let mut iter = SstConcatIterator::create_and_seek_to_key(
+                        level_ssts,
+                        KeySlice::from_slice(key),
+                    )?;
+                    if iter.is_valid() && iter.key().raw_ref() == key {
+                        iter.next()?;
+                    }
+                    iter
                 }
-                iter
-            }
-            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(l1_ssts)?,
-        };
+                Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(level_ssts)?,
+            };
+            level_concat_iters.push(Box::new(level_concat_iter));
+        }
 
         // 构造LsmIterator
         let memtable_merge_iter = MergeIterator::create(mem_iters);
         let l0_sst_merge_iter = MergeIterator::create(l0_sst_iters);
         let mem_l0_iter = TwoMergeIterator::create(memtable_merge_iter, l0_sst_merge_iter)?;
-        let lsm_inner_iter = TwoMergeIterator::create(mem_l0_iter, l1_concat_iter)?;
+        let levels_merge_iter = MergeIterator::create(level_concat_iters);
+        let lsm_inner_iter = TwoMergeIterator::create(mem_l0_iter, levels_merge_iter)?;
         let end_bound = map_bound(_upper);
         let lsm_iter = LsmIterator::new(lsm_inner_iter, end_bound)?;
         Ok(FusedIterator::new(lsm_iter))
