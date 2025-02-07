@@ -113,9 +113,27 @@ pub enum CompactionOptions {
 
 impl LsmStorageInner {
     fn compact(&self, _task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
+        let snapshot = {
+            let state = self.state.read();
+            state.clone()
+        };
         match _task {
             CompactionTask::Leveled(task) => unimplemented!(),
-            CompactionTask::Tiered(task) => unimplemented!(),
+            CompactionTask::Tiered(task) => {
+                let mut iters = Vec::with_capacity(task.tiers.len());
+                for (_, sst_ids) in task.tiers.iter() {
+                    let mut ssts = Vec::with_capacity(sst_ids.len());
+                    for sst_id in sst_ids.iter() {
+                        ssts.push(snapshot.sstables.get(sst_id).unwrap().clone());
+                    }
+                    iters.push(Box::new(SstConcatIterator::create_and_seek_to_first(ssts)?));
+                }
+                let merge_iter = MergeIterator::create(iters);
+                self.merge_two_level(
+                    merge_iter,
+                    SstConcatIterator::create_and_seek_to_first(vec![])?,
+                )
+            }
             CompactionTask::Simple(task) => {
                 if task.upper_level.is_none() {
                     let new_task = CompactionTask::ForceFullCompaction {
@@ -124,10 +142,6 @@ impl LsmStorageInner {
                     };
                     return self.compact(&new_task);
                 }
-                let snapshot = {
-                    let state = self.state.read();
-                    state.clone()
-                };
                 // create concat iterator for upper level and lower level
                 let mut upper_ssts = Vec::with_capacity(task.upper_level_sst_ids.len());
                 for sst_id in task.upper_level_sst_ids.iter() {
@@ -146,10 +160,6 @@ impl LsmStorageInner {
                 l0_sstables,
                 l1_sstables,
             } => {
-                let snapshot = {
-                    let state = self.state.read();
-                    state.clone()
-                };
                 // create merge iterator for L0
                 let mut l0_iters = Vec::with_capacity(l0_sstables.len());
                 for sst_id in l0_sstables.iter() {

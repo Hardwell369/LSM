@@ -435,7 +435,6 @@ impl LsmStorageInner {
     }
 
     /// Force flush the earliest-created immutable memtable to disk
-    // 该函数目前可能存在问题
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
         let _state_lock = self.state_lock.lock();
 
@@ -457,13 +456,16 @@ impl LsmStorageInner {
         {
             let mut snapshot = self.state.write();
             let mut state_copy = snapshot.as_ref().clone();
-            // // 如果在获取写锁的过程中，imm_memtable已经被其他线程flush到磁盘，则直接返回
-            // if imm_memtable.id() != state_copy.imm_memtables.last().unwrap().id() {
-            //     return Ok(());
-            // }
             state_copy.imm_memtables.pop();
             state_copy.sstables.insert(sst_id, Arc::new(sst));
-            state_copy.l0_sstables.insert(0, sst_id);
+            // 判断是否需要将SST文件写入L0 SSTs
+            if self.compaction_controller.flush_to_l0() {
+                // in leveled compaction or no compaction, flush to L0
+                state_copy.l0_sstables.insert(0, sst_id);
+            } else {
+                // in tiered compaction, create and flush to a new tier
+                state_copy.levels.insert(0, (sst_id, vec![sst_id]));
+            }
             *snapshot = Arc::new(state_copy);
         }
         Ok(())
