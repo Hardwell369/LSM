@@ -118,7 +118,28 @@ impl LsmStorageInner {
             state.clone()
         };
         match _task {
-            CompactionTask::Leveled(task) => unimplemented!(),
+            CompactionTask::Leveled(task) => {
+                if task.upper_level.is_none() {
+                    let new_task = CompactionTask::ForceFullCompaction {
+                        l0_sstables: task.upper_level_sst_ids.clone(),
+                        l1_sstables: task.lower_level_sst_ids.clone(),
+                    };
+                    return self.compact(&new_task);
+                }
+                // create concat iterator for upper level and lower level
+                let mut upper_ssts = Vec::with_capacity(task.upper_level_sst_ids.len());
+                for sst_id in task.upper_level_sst_ids.iter() {
+                    upper_ssts.push(snapshot.sstables.get(sst_id).unwrap().clone());
+                }
+                let upper_concat_iter = SstConcatIterator::create_and_seek_to_first(upper_ssts)?;
+                let mut lower_ssts = Vec::with_capacity(task.lower_level_sst_ids.len());
+                for sst_id in task.lower_level_sst_ids.iter() {
+                    lower_ssts.push(snapshot.sstables.get(sst_id).unwrap().clone());
+                }
+                let lower_concat_iter = SstConcatIterator::create_and_seek_to_first(lower_ssts)?;
+                // merge upper and lower level
+                self.merge_two_level(upper_concat_iter, lower_concat_iter)
+            }
             CompactionTask::Tiered(task) => {
                 let mut iters = Vec::with_capacity(task.tiers.len());
                 for (_, sst_ids) in task.tiers.iter() {
