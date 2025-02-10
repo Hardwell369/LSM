@@ -1,7 +1,7 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ use crate::iterators::{merge_iterator::MergeIterator, two_merge_iterator::TwoMer
 use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
-use crate::mem_table::{self, map_bound, MemTable};
+use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTableIterator};
 use crate::table::{SsTable, SsTableBuilder};
@@ -181,8 +181,10 @@ impl MiniLsm {
                 .join()
                 .map_err(|e| anyhow::anyhow!("Error when joining flush thread: {:?}", e))?;
         }
-        // 若 enable_wal 为 true，则直接返回
+        // 若 enable_wal 为 true，则把 WAL 存储到磁盘中
         if self.inner.options.enable_wal {
+            self.inner.sync()?;
+            self.inner.sync_dir()?;
             return Ok(());
         }
         // 若 enable_wal 为 false，则需要存储所有的 memtable 到磁盘中
@@ -304,13 +306,24 @@ impl LsmStorageInner {
         };
 
         if !manifest_path.exists() {
+            // 默认创建的memtable不带有WAL，若启用了WAL，则需要进行替换
+            if options.enable_wal {
+                state.memtable = Arc::new(MemTable::create_with_wal(
+                    state.memtable.id(),
+                    Self::path_of_wal_static(path, state.memtable.id()),
+                )?);
+            }
             manifest = Some(
                 Manifest::create(manifest_path).context("failed  to create manifest directory")?,
             );
+            manifest
+                .as_ref()
+                .unwrap()
+                .add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
         } else {
             // 读取持久化操作的记录
             let (m, records) = Manifest::recover(&manifest_path)?;
-            manifest = Some(m);
+            let mut memtables = BTreeSet::new();
             // 依据记录， 回放操作，恢复状态
             for record in records {
                 match record {
@@ -321,7 +334,10 @@ impl LsmStorageInner {
                             state.levels.insert(0, (sst_id, vec![sst_id]));
                         }
                     }
-                    ManifestRecord::NewMemtable(_) => unimplemented!(),
+                    ManifestRecord::NewMemtable(memtable_id) => {
+                        next_sst_id = next_sst_id.max(memtable_id);
+                        memtables.insert(next_sst_id);
+                    }
                     ManifestRecord::Compaction(task, output) => {
                         let (new_state, _) = compaction_controller
                             .apply_compaction_result(&state, &task, &output, true);
@@ -359,12 +375,34 @@ impl LsmStorageInner {
                     .1
                     .sort_by_key(|a| state.sstables.get(a).unwrap().first_key().clone());
             }
-        }
 
-        // 为state创建新的memtable
-        next_sst_id += 1;
-        state.memtable = Arc::new(MemTable::create(next_sst_id));
-        next_sst_id += 1;
+            next_sst_id += 1;
+
+            // 恢复 memtable 到 state.imm_memtables 中，并创建新的 memtable
+            if options.enable_wal {
+                for id in memtables.iter() {
+                    // 若WAL文件不存在，则跳过
+                    // WAL不存在的情况是因为较早的memtable已经被flush到了SST文件中，此时WAL文件已经被删除，但是manifest中仍然记录了该memtable
+                    if !Self::path_of_wal_static(path, *id).exists() {
+                        continue;
+                    }
+                    let memtable =
+                        MemTable::recover_from_wal(*id, Self::path_of_wal_static(path, *id))?;
+                    if !memtable.is_empty() {
+                        state.imm_memtables.insert(0, Arc::new(memtable));
+                    }
+                }
+                state.memtable = Arc::new(MemTable::create_with_wal(
+                    next_sst_id,
+                    Self::path_of_wal_static(path, next_sst_id),
+                )?);
+            } else {
+                state.memtable = Arc::new(MemTable::create(next_sst_id));
+            }
+            m.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
+            next_sst_id += 1;
+            manifest = Some(m);
+        };
 
         let storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
@@ -384,7 +422,7 @@ impl LsmStorageInner {
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        self.state.read().memtable.sync_wal()
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
@@ -536,13 +574,31 @@ impl LsmStorageInner {
         snapshot.imm_memtables.insert(0, old_memtable.clone());
         // update snapshot
         *state = Arc::new(snapshot);
+        drop(state);
+        // sync the WAL file
+        old_memtable.sync_wal()?;
         Ok(())
     }
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        let new_memtable = Arc::new(MemTable::create(self.next_sst_id()));
+        let new_memtable_id = self.next_sst_id();
+        // 一个memtable对应一个Wal文件
+        let new_memtable = if self.options.enable_wal {
+            Arc::new(MemTable::create_with_wal(
+                new_memtable_id,
+                self.path_of_wal(new_memtable_id),
+            )?)
+        } else {
+            Arc::new(MemTable::create(new_memtable_id))
+        };
         self.freeze_memtable_with_memtable(new_memtable)?;
+        // 把freeze操作记录到manifest中
+        self.manifest.as_ref().unwrap().add_record(
+            _state_lock_observer,
+            ManifestRecord::NewMemtable(new_memtable_id),
+        )?;
+        self.sync_dir()?;
         Ok(())
     }
 
@@ -580,6 +636,12 @@ impl LsmStorageInner {
             }
             *state = Arc::new(snapshot);
         }
+
+        // 若memtable不存在了，就删除对应的WAL
+        if self.options.enable_wal {
+            std::fs::remove_file(self.path_of_wal(sst_id))?;
+        }
+
         // 更新manifest
         self.manifest
             .as_ref()
