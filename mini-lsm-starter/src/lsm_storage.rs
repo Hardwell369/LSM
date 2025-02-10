@@ -1,5 +1,6 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::ops::{Bound, Deref};
@@ -331,18 +332,25 @@ impl LsmStorageInner {
                 }
             }
             // 读取sst文件到state中
-            for sst_id in state
+            // 并发读取SST文件，提高读取速度
+            let ssts: Vec<_> = state
                 .l0_sstables
                 .iter()
                 .chain(state.levels.iter().flat_map(|(_, ssts)| ssts.iter()))
-            {
-                let sst = SsTable::open(
-                    *sst_id,
-                    Some(block_cache.clone()),
-                    FileObject::open(&Self::path_of_sst_static(path, *sst_id))
-                        .context("failed to open SST file")?,
-                )?;
-                state.sstables.insert(*sst_id, Arc::new(sst));
+                .collect::<Vec<_>>()
+                .par_iter()
+                .map(|&&sst_id| -> Result<(usize, Arc<SsTable>)> {
+                    let sst = SsTable::open(
+                        sst_id,
+                        Some(block_cache.clone()),
+                        FileObject::open(&Self::path_of_sst_static(path, sst_id))
+                            .context("failed to open SST file")?,
+                    )?;
+                    Ok((sst_id, Arc::new(sst)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (sst_id, sst) in ssts {
+                state.sstables.insert(sst_id, sst);
             }
 
             // sort each level
