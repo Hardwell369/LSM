@@ -165,11 +165,14 @@ impl LeveledCompactionController {
             .1
             .retain(|x| !files_needed_removal.contains(x));
 
-        // Add new SST IDs to the lower level and sort them
+        // Add new SST IDs to the lower level
         snapshot.levels[_task.lower_level - 1].1.extend(_output);
-        snapshot.levels[_task.lower_level - 1]
-            .1
-            .sort_by_key(|a| snapshot.sstables.get(a).unwrap().first_key().clone());
+        // Sort SSTs in the level (only in not recovery mode)
+        if !_in_recovery {
+            snapshot.levels[_task.lower_level - 1]
+                .1
+                .sort_by_key(|a| snapshot.sstables.get(a).unwrap().first_key().clone());
+        }
 
         (snapshot, files_needed_removal.into_iter().collect())
     }

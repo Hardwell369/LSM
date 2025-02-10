@@ -20,6 +20,7 @@ use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::Key;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -330,8 +331,15 @@ impl LsmStorageInner {
                 }
                 let mut state = self.state.write();
                 *state = Arc::new(snapshot);
+                drop(state);
+                // write to manifest
+                self.manifest
+                    .as_ref()
+                    .unwrap()
+                    .add_record(&_state_lock, ManifestRecord::Compaction(task, output))?;
             }
         }
+        self.sync_dir()?;
         Ok(())
     }
 
