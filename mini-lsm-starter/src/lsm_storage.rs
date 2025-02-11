@@ -237,11 +237,11 @@ impl MiniLsm {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.inner.put(key, value)
+        self.write_batch(&[WriteBatchRecord::Put(key, value)])
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.inner.delete(key)
+        self.write_batch(&[WriteBatchRecord::Del(key)])
     }
 
     pub fn sync(&self) -> Result<()> {
@@ -511,9 +511,15 @@ impl LsmStorageInner {
         Ok(None)
     }
 
-    /// Write a batch of data into the storage. Implement in week 2 day 7.
+    /// Write a batch of data into the storage.
     pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
+        for record in _batch {
+            match record {
+                WriteBatchRecord::Put(key, value) => self.put(key.as_ref(), value.as_ref())?,
+                WriteBatchRecord::Del(key) => self.delete(key.as_ref())?,
+            }
+        }
+        Ok(())
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.

@@ -1,8 +1,4 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use bytes::Bytes;
-use serde_json::to_vec;
 
 use crate::key::{KeySlice, KeyVec};
 

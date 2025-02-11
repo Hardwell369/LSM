@@ -1,4 +1,3 @@
-use core::hash;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -77,7 +76,7 @@ impl SsTableBuilder {
         if !self.builder.is_empty() {
             self.split_block();
         }
-        // SST File: data blocks | meta blocks | block meta offset(u32) | bloom filter | bloom filter offset(u32)
+        // SST File: data blocks (each block end with checksum[u32]) | meta blocks | block meta offset(u32) | bloom filter | bloom filter offset(u32)
         /* data blocks */
         let mut buf = self.data;
         /* meta blocks */

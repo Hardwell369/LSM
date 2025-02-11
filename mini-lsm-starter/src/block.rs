@@ -1,11 +1,9 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 mod builder;
 mod iterator;
 
 pub use builder::BlockBuilder;
 use bytes::Bytes;
+use crc32fast;
 pub use iterator::BlockIterator;
 
 /// A block is the smallest unit of read and caching in LSM tree. It is a collection of sorted key-value pairs.
@@ -16,9 +14,8 @@ pub struct Block {
 
 impl Block {
     /// Encode the internal data to the data layout illustrated in the tutorial
-    /// Note: You may want to recheck if any of the expected field is missing from your output
     pub fn encode(&self) -> Bytes {
-        // 格式：data | offsets | num_of_entries
+        // 格式：data | offsets(num_of_entries  *2) | num_of_entries(u16) | checksum(u32)
         let mut encoded: Vec<u8> = vec![];
         let num_of_entries = self.offsets.len() as u16;
         encoded.extend_from_slice(&self.data[..]);
@@ -26,22 +23,33 @@ impl Block {
             encoded.extend_from_slice(&offset.to_be_bytes());
         }
         encoded.extend_from_slice(&num_of_entries.to_be_bytes());
+        let checksum = crc32fast::hash(&encoded);
+        encoded.extend_from_slice(&checksum.to_be_bytes());
         Bytes::from(encoded)
     }
 
     /// Decode from the data layout, transform the input `data` to a single `Block`
     pub fn decode(data: &[u8]) -> Self {
         let data_len = data.len();
-        let num_of_entries = u16::from_be_bytes([data[data_len - 2], data[data_len - 1]]);
-        // 存储entries所用的空间长度 （总空间长度 - num_of_entries所用长度 - offsets所用长度）
-        let entries_len = data_len - 2 - num_of_entries as usize * 2;
+        // 读取checksum
+        let checksum = u32::from_be_bytes(data[data_len - 4..].try_into().unwrap());
+        // 计算checksum
+        let checksum_calculated = crc32fast::hash(&data[..data_len - 4]);
+        if checksum != checksum_calculated {
+            panic!("Checksum error while Block decoding");
+        }
+        // 读取 num_of_entries
+        let num_of_entries =
+            u16::from_be_bytes(data[data_len - 6..data_len - 4].try_into().unwrap());
+        // 计算entries和offsets的长度
+        let offset_len = num_of_entries as usize * 2;
+        let entries_len = data_len - 6 - offset_len;
 
         let entries = data[..entries_len].to_vec();
-        let mut offsets = Vec::with_capacity(num_of_entries as usize);
-
-        for i in (entries_len..data_len - 2).step_by(2) {
-            offsets.push(u16::from_be_bytes([data[i], data[i + 1]]));
-        }
+        let offsets = (entries_len..data_len - 6)
+            .step_by(2)
+            .map(|i| u16::from_be_bytes(data[i..i + 2].try_into().unwrap()))
+            .collect();
 
         Self {
             data: entries,

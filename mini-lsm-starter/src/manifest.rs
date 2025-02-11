@@ -1,12 +1,10 @@
-#![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
-
-use serde_json::Deserializer;
+use bytes::{Buf, BufMut};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -45,10 +43,18 @@ impl Manifest {
             .context("failed to open manifest file")?;
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
-        let stream = Deserializer::from_slice(&buf).into_iter::<ManifestRecord>();
+        let mut buf_slice = buf.as_slice();
         let mut records = Vec::new();
-        for record in stream {
-            records.push(record?);
+        while buf_slice.has_remaining() {
+            let record_size = buf_slice.get_u64() as usize;
+            let record_slice = buf_slice.copy_to_bytes(record_size);
+            let record = serde_json::from_slice::<ManifestRecord>(&record_slice)?;
+            let checksum = buf_slice.get_u32();
+            let checksum_calculated = crc32fast::hash(&record_slice);
+            if checksum != checksum_calculated {
+                bail!("Checksum error while Manifest decoding");
+            }
+            records.push(record);
         }
         Ok((
             Self {
@@ -67,8 +73,14 @@ impl Manifest {
     }
 
     pub fn add_record_when_init(&self, _record: ManifestRecord) -> Result<()> {
+        // each record: record_size(u64) | record | checksum(u32)
         let mut file = self.file.lock();
-        let buf = serde_json::to_vec(&_record)?;
+        let mut buf = serde_json::to_vec(&_record)?;
+        let record_size = buf.len() as u64;
+        // 计算并添加 checksum
+        let checksum = crc32fast::hash(&buf);
+        buf.put_u32(checksum);
+        file.write_all(&record_size.to_be_bytes())?;
         file.write_all(&buf)?;
         // 避免操作系统缓存，立即将数据写入磁盘
         file.sync_all()?;

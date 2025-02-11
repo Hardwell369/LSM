@@ -29,9 +29,9 @@ pub struct BlockMeta {
 
 impl BlockMeta {
     /// Encode block meta to a buffer.
-    /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
     pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
+        let offset = buf.len();
         // buf: len (4 bytes)
         buf.put_u32(block_meta.len() as u32);
         // buf: offset (4 bytes) | first_key_len (2 bytes) | first_key | last_key_len (2 bytes) | last_key
@@ -42,11 +42,21 @@ impl BlockMeta {
             buf.put_u16(meta.last_key.len() as u16);
             buf.extend_from_slice(meta.last_key.raw_ref());
         }
+        // 计算checksum，只计算block meta的部分
+        let checksum = crc32fast::hash(&buf[offset + 4..]);
+        buf.put_u32(checksum);
     }
 
     /// Decode block meta from a buffer.
     pub fn decode_block_meta(mut buf: &[u8]) -> Vec<BlockMeta> {
         let num_of_block_meta = buf.get_u32() as usize;
+        // 读取 checksum
+        let checksum = (&buf[buf.len() - 4..]).get_u32();
+        // 计算 checksum
+        let checksum_calculated = crc32fast::hash(&buf[..buf.len() - 4]);
+        if checksum != checksum_calculated {
+            panic!("Checksum error while BlockMeta decoding");
+        }
         let mut res = Vec::with_capacity(num_of_block_meta);
         for _ in 0..num_of_block_meta {
             let offset = buf.get_u32() as usize;
