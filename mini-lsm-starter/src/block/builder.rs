@@ -46,8 +46,8 @@ impl BlockBuilder {
             self.compute_key_prefix_size(key)
         };
         let rest_key_len = (key.key_len() - overlap_size) as u16;
-        let value_len = value.key_len() as u16;
-        self.offsets.push(self.data.key_len() as u16);
+        let value_len = value.len() as u16;
+        self.offsets.push(self.data.len() as u16);
         // data: key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) | timestamp (u64) | value_len (u16) | value (value_len)
         self.data
             .extend_from_slice(&(overlap_size as u16).to_be_bytes());
@@ -83,7 +83,7 @@ impl BlockBuilder {
         // 2 * self.offsets.key_len() 是因为每个offset是u16，占2个字节
         let overlap_size = self.compute_key_prefix_size(key);
         let rest_key_len = key.key_len() - overlap_size;
-        self.data.key_len() + self.offsets.key_len() * 2 + 4 + rest_key_len + 2 + value.key_len()
+        self.data.len() + self.offsets.len() * 2 + 4 + rest_key_len + 2 + value.len()
             > self.block_size
     }
 
@@ -106,7 +106,7 @@ impl BlockBuilder {
     pub fn last_key(&self) -> Bytes {
         if self.is_empty() {
             Bytes::new()
-        } else if self.offsets.key_len() == 1 {
+        } else if self.offsets.len() == 1 {
             self.first_key.key_ref().to_vec().into()
         } else {
             let offset = self.offsets.last().copied().unwrap_or(0) as usize;

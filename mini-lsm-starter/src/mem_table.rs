@@ -11,7 +11,7 @@ use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
 
 use crate::iterators::StorageIterator;
-use crate::key::{KeyBytes, KeySlice};
+use crate::key::{KeyBytes, KeySlice, TS_DEFAULT};
 use crate::table::SsTableBuilder;
 use crate::wal::Wal;
 
@@ -40,15 +40,13 @@ pub(crate) fn map_key_bound(bound: Bound<KeySlice>) -> Bound<KeyBytes> {
     }
 }
 
-
-pub(crate) fn map_key_bound_with_ts(bound: Bound<&[u8], ts: u64) -> Bound<KeySlice> {
+pub(crate) fn map_key_bound_with_ts(bound: Bound<&[u8]>, ts: u64) -> Bound<KeySlice> {
     match bound {
         Bound::Included(x) => Bound::Included(KeySlice::from_slice(x, ts)),
         Bound::Excluded(x) => Bound::Excluded(KeySlice::from_slice(x, ts)),
         Bound::Unbounded => Bound::Unbounded,
     }
 }
-
 
 impl MemTable {
     /// Create a new mem-table.
@@ -117,7 +115,7 @@ impl MemTable {
     /// In week 3, day 5, modify the function to use the batch API.
     pub fn put(&self, _key: KeySlice, _value: &[u8]) -> Result<()> {
         self.approximate_size.fetch_add(
-            _key.len() + _value.len(),
+            _key.key_len() + _value.len(),
             std::sync::atomic::Ordering::Relaxed,
         );
         self.map.insert(

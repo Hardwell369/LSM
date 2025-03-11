@@ -22,9 +22,10 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::StorageIterator;
 use crate::iterators::{merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator};
 use crate::key::KeySlice;
+use crate::key::{TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
-use crate::mem_table::{map_bound, map_key_bound_with_ts, MemTable};
+use crate::mem_table::{map_key_bound_with_ts, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTableIterator};
 use crate::table::{SsTable, SsTableBuilder};
@@ -431,7 +432,7 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         // 克隆数据快照，避免长时间占用读锁
         let snapshot = {
             let guard = self.state.read();
@@ -443,7 +444,7 @@ impl LsmStorageInner {
             Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN)),
             Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
         );
-        if memtable_iter.is_valid() && memtable_iter.key().key_ref() == _key {
+        if memtable_iter.is_valid() && memtable_iter.key().key_ref() == key {
             if memtable_iter.value().is_empty() {
                 return Ok(None);
             }
@@ -455,7 +456,7 @@ impl LsmStorageInner {
                 Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN)),
                 Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
             );
-            if imm_memtable_iter.is_valid() && imm_memtable_iter.key().key_ref() == _key {
+            if imm_memtable_iter.is_valid() && imm_memtable_iter.key().key_ref() == key {
                 if imm_memtable_iter.value().is_empty() {
                     return Ok(None);
                 }
@@ -474,18 +475,18 @@ impl LsmStorageInner {
                     .bloom
                     .as_ref()
                     .unwrap()
-                    .may_contain(farmhash::fingerprint32(_key))
+                    .may_contain(farmhash::fingerprint32(key))
             {
                 continue;
             }
             let first_key = sst.first_key().as_key_slice().key_ref();
             let last_key = sst.last_key().as_key_slice().key_ref();
-            if _key >= first_key && _key <= last_key {
+            if key >= first_key && key <= last_key {
                 let sst_iter = SsTableIterator::create_and_seek_to_key(
                     sst,
-                    KeySlice::from_slice(_key, TS_RANGE_BEGIN),
+                    KeySlice::from_slice(key, TS_RANGE_BEGIN),
                 )?;
-                if sst_iter.is_valid() && sst_iter.key().key_ref() == _key {
+                if sst_iter.is_valid() && sst_iter.key().key_ref() == key {
                     if sst_iter.value().is_empty() {
                         return Ok(None);
                     }
@@ -503,7 +504,7 @@ impl LsmStorageInner {
                         .bloom
                         .as_ref()
                         .unwrap()
-                        .may_contain(farmhash::fingerprint32(_key))
+                        .may_contain(farmhash::fingerprint32(key))
                 {
                     continue;
                 }
@@ -511,9 +512,9 @@ impl LsmStorageInner {
             }
             let level_iter = SstConcatIterator::create_and_seek_to_key(
                 ssts,
-                KeySlice::from_slice(_key, TS_RANGE_BEGIN),
+                KeySlice::from_slice(key, TS_RANGE_BEGIN),
             )?;
-            if level_iter.is_valid() && level_iter.key().key_ref() == _key {
+            if level_iter.is_valid() && level_iter.key().key_ref() == key {
                 if level_iter.value().is_empty() {
                     return Ok(None);
                 }
