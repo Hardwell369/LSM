@@ -50,7 +50,7 @@ impl BlockIterator {
 
     /// Returns the key of the current entry.
     pub fn key(&self) -> KeySlice {
-        KeySlice::from_slice(self.key.raw_ref())
+        KeySlice::from_slice(self.key.key_ref())
     }
 
     /// Returns the value of the current entry.
@@ -85,7 +85,7 @@ impl BlockIterator {
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        if key.raw_ref() <= self.first_key.raw_ref() {
+        if key.key_ref() <= self.first_key.key_ref() {
             self.seek_to_first();
             return;
         }
@@ -94,7 +94,7 @@ impl BlockIterator {
         while left < right {
             let mid = (right + left) / 2;
             let mid_key = self.get_key_at(mid);
-            if mid_key.raw_ref() < key.raw_ref() {
+            if mid_key.key_ref() < key.key_ref() {
                 left = mid + 1;
             } else {
                 right = mid;
@@ -110,44 +110,49 @@ impl BlockIterator {
 
     /// Updates the current key and value range based on the current index.
     fn update_key_and_value_range(&mut self) {
-        let entries_range_start = self.block.offsets[self.idx] as usize;
+        let mut entries_range_start = self.block.offsets[self.idx] as usize;
         let overlap_size = self.get_u16_at(entries_range_start);
-        let rest_key_len = self.get_u16_at(entries_range_start + 2);
+        entries_range_start += 2;
+        let rest_key_len = self.get_u16_at(entries_range_start);
+        entries_range_start += 2;
         self.key = KeyVec::from_vec(
             self.first_key
-                .raw_ref()
+                .key_ref()
                 .iter()
                 .take(overlap_size as usize)
                 .chain(
                     self.block.data
-                        [entries_range_start + 4..entries_range_start + 4 + rest_key_len as usize]
+                        [entries_range_start..entries_range_start + rest_key_len as usize]
                         .iter(),
                 )
                 .cloned()
                 .collect(),
         );
-        let value_len = self.get_u16_at(entries_range_start + 4 + rest_key_len as usize);
-        let entries_range_end =
-            entries_range_start + 4 + rest_key_len as usize + 2 + value_len as usize;
-        self.value_range = (
-            entries_range_start + 4 + rest_key_len as usize + 2,
-            entries_range_end,
-        );
+        entries_range_start += rest_key_len as usize;
+        let ts = self.get_u64_at(entries_range_start);
+        self.key.set_ts(ts);
+        entries_range_start += 8;
+        let value_len = self.get_u16_at(entries_range_start);
+        entries_range_start += 2;
+        let entries_range_end = entries_range_start + value_len as usize;
+        self.value_range = (entries_range_start, entries_range_end);
     }
 
     /// Gets the key at the specified index.
     fn get_key_at(&self, index: usize) -> KeyVec {
-        let entries_range_start = self.block.offsets[index] as usize;
+        let mut entries_range_start = self.block.offsets[index] as usize;
         let overlap_size = self.get_u16_at(entries_range_start);
-        let rest_key_len = self.get_u16_at(entries_range_start + 2);
+        entries_range_start += 2;
+        let rest_key_len = self.get_u16_at(entries_range_start);
+        entries_range_start += 2;
         KeyVec::from_vec(
             self.first_key
-                .raw_ref()
+                .key_ref()
                 .iter()
                 .take(overlap_size as usize)
                 .chain(
                     self.block.data
-                        [entries_range_start + 4..entries_range_start + 4 + rest_key_len as usize]
+                        [entries_range_start..entries_range_start + rest_key_len as usize]
                         .iter(),
                 )
                 .cloned()
@@ -158,5 +163,17 @@ impl BlockIterator {
     /// Reads a u16 value from the block data at the specified position.
     fn get_u16_at(&self, pos: usize) -> u16 {
         ((self.block.data[pos] as u16) << 8) | (self.block.data[pos + 1] as u16)
+    }
+
+    /// Reads a u64 value from the block data at the specified position.
+    fn get_u64_at(&self, pos: usize) -> u64 {
+        ((self.block.data[pos] as u64) << 56)
+            | ((self.block.data[pos + 1] as u64) << 48)
+            | ((self.block.data[pos + 2] as u64) << 40)
+            | ((self.block.data[pos + 3] as u64) << 32)
+            | ((self.block.data[pos + 4] as u64) << 24)
+            | ((self.block.data[pos + 5] as u64) << 16)
+            | ((self.block.data[pos + 6] as u64) << 8)
+            | (self.block.data[pos + 7] as u64)
     }
 }

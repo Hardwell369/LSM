@@ -9,7 +9,7 @@ use self::bloom::Bloom;
 use super::{bloom, BlockMeta, SsTable};
 use crate::{
     block::BlockBuilder,
-    key::{KeyBytes, KeySlice},
+    key::{KeyBytes, KeySlice, KeyVec},
     lsm_storage::BlockCache,
     table::FileObject,
 };
@@ -17,8 +17,8 @@ use crate::{
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
-    first_key: Vec<u8>,
-    last_key: Vec<u8>,
+    first_key: KeyVec,
+    last_key: KeyVec,
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     hash_keys: Vec<u32>, // hash keys for bloom filter
@@ -45,7 +45,7 @@ impl SsTableBuilder {
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         if self.first_key.is_empty() {
-            self.first_key = key.raw_ref().to_vec();
+            self.first_key.set_from_slice(key);
         }
 
         if !self.builder.add(key, value) {
@@ -53,8 +53,8 @@ impl SsTableBuilder {
             let _ = self.builder.add(key, value);
         }
 
-        self.last_key = key.raw_ref().to_vec();
-        self.hash_keys.push(farmhash::fingerprint32(key.raw_ref()));
+        self.last_key.set_from_slice(key);
+        self.hash_keys.push(farmhash::fingerprint32(key.key_ref()));
     }
 
     /// Get the estimated size of the SSTable.

@@ -24,7 +24,7 @@ use crate::iterators::{merge_iterator::MergeIterator, two_merge_iterator::TwoMer
 use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
-use crate::mem_table::{map_bound, MemTable};
+use crate::mem_table::{map_bound, map_key_bound_with_ts, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTableIterator};
 use crate::table::{SsTable, SsTableBuilder};
@@ -439,19 +439,27 @@ impl LsmStorageInner {
         };
         /* 从内存中查找 */
         // 从memtable中查找
-        if let Some(value) = snapshot.memtable.get(_key) {
-            if value.is_empty() {
+        let memtable_iter = snapshot.memtable.scan(
+            Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN)),
+            Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
+        );
+        if memtable_iter.is_valid() && memtable_iter.key().key_ref() == _key {
+            if memtable_iter.value().is_empty() {
                 return Ok(None);
             }
-            return Ok(Some(value));
+            return Ok(Some(Bytes::copy_from_slice(memtable_iter.value())));
         }
         // 从imm_memtable（由新到旧排序）中查找
         for imm_memtable in snapshot.imm_memtables.iter() {
-            if let Some(value) = imm_memtable.get(_key) {
-                if value.is_empty() {
+            let imm_memtable_iter = imm_memtable.scan(
+                Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN)),
+                Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
+            );
+            if imm_memtable_iter.is_valid() && imm_memtable_iter.key().key_ref() == _key {
+                if imm_memtable_iter.value().is_empty() {
                     return Ok(None);
                 }
-                return Ok(Some(value));
+                return Ok(Some(Bytes::copy_from_slice(imm_memtable_iter.value())));
             }
         }
 
@@ -470,12 +478,14 @@ impl LsmStorageInner {
             {
                 continue;
             }
-            let first_key = sst.first_key().as_key_slice().raw_ref();
-            let last_key = sst.last_key().as_key_slice().raw_ref();
+            let first_key = sst.first_key().as_key_slice().key_ref();
+            let last_key = sst.last_key().as_key_slice().key_ref();
             if _key >= first_key && _key <= last_key {
-                let sst_iter =
-                    SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(_key))?;
-                if sst_iter.is_valid() && sst_iter.key().raw_ref() == _key {
+                let sst_iter = SsTableIterator::create_and_seek_to_key(
+                    sst,
+                    KeySlice::from_slice(_key, TS_RANGE_BEGIN),
+                )?;
+                if sst_iter.is_valid() && sst_iter.key().key_ref() == _key {
                     if sst_iter.value().is_empty() {
                         return Ok(None);
                     }
@@ -499,9 +509,11 @@ impl LsmStorageInner {
                 }
                 ssts.push(sst);
             }
-            let level_iter =
-                SstConcatIterator::create_and_seek_to_key(ssts, KeySlice::from_slice(_key))?;
-            if level_iter.is_valid() && level_iter.key().raw_ref() == _key {
+            let level_iter = SstConcatIterator::create_and_seek_to_key(
+                ssts,
+                KeySlice::from_slice(_key, TS_RANGE_BEGIN),
+            )?;
+            if level_iter.is_valid() && level_iter.key().key_ref() == _key {
                 if level_iter.value().is_empty() {
                     return Ok(None);
                 }
@@ -676,10 +688,16 @@ impl LsmStorageInner {
         };
         // 依据范围，获取memtable和imm_memtable的迭代器
         let mut mem_iters = Vec::new();
-        let memtable_iter = snapshot.memtable.scan(_lower, _upper);
+        let memtable_iter = snapshot.memtable.scan(
+            map_key_bound_with_ts(_lower, TS_RANGE_BEGIN),
+            map_key_bound_with_ts(_upper, TS_RANGE_END),
+        );
         mem_iters.push(Box::new(memtable_iter));
         for imm_memtable in snapshot.imm_memtables.iter() {
-            let imm_memtable_iter = imm_memtable.scan(_lower, _upper);
+            let imm_memtable_iter = imm_memtable.scan(
+                map_key_bound_with_ts(_lower, TS_RANGE_BEGIN),
+                map_key_bound_with_ts(_upper, TS_RANGE_END),
+            );
             mem_iters.push(Box::new(imm_memtable_iter));
         }
 
@@ -697,15 +715,16 @@ impl LsmStorageInner {
                 sst.last_key().as_key_slice(),
             ) {
                 let sst_iter = match _lower {
-                    Bound::Included(key) => {
-                        SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))?
-                    }
+                    Bound::Included(key) => SsTableIterator::create_and_seek_to_key(
+                        sst,
+                        KeySlice::from_slice(key, TS_RANGE_BEGIN),
+                    )?,
                     Bound::Excluded(key) => {
                         let mut iter = SsTableIterator::create_and_seek_to_key(
                             sst,
-                            KeySlice::from_slice(key),
+                            KeySlice::from_slice(key, TS_RANGE_BEGIN),
                         )?;
-                        if iter.is_valid() && iter.key().raw_ref() == key {
+                        if iter.is_valid() && iter.key().key_ref() == key {
                             iter.next()?;
                         }
                         iter
@@ -725,14 +744,14 @@ impl LsmStorageInner {
             let level_concat_iter = match _lower {
                 Bound::Included(key) => SstConcatIterator::create_and_seek_to_key(
                     level_ssts,
-                    KeySlice::from_slice(key),
+                    KeySlice::from_slice(key, TS_RANGE_BEGIN),
                 )?,
                 Bound::Excluded(key) => {
                     let mut iter = SstConcatIterator::create_and_seek_to_key(
                         level_ssts,
-                        KeySlice::from_slice(key),
+                        KeySlice::from_slice(key, TS_RANGE_BEGIN),
                     )?;
-                    if iter.is_valid() && iter.key().raw_ref() == key {
+                    if iter.is_valid() && iter.key().key_ref() == key {
                         iter.next()?;
                     }
                     iter
@@ -762,13 +781,13 @@ impl LsmStorageInner {
         sst_last_key: KeySlice,
     ) -> bool {
         match upper {
-            Bound::Excluded(key) if key <= sst_first_key.raw_ref() => return false,
-            Bound::Included(key) if key < sst_first_key.raw_ref() => return false,
+            Bound::Excluded(key) if key <= sst_first_key.key_ref() => return false,
+            Bound::Included(key) if key < sst_first_key.key_ref() => return false,
             _ => {}
         }
         match lower {
-            Bound::Excluded(key) if key >= sst_last_key.raw_ref() => return false,
-            Bound::Included(key) if key > sst_last_key.raw_ref() => return false,
+            Bound::Excluded(key) if key >= sst_last_key.key_ref() => return false,
+            Bound::Included(key) if key > sst_last_key.key_ref() => return false,
             _ => {}
         }
         true
