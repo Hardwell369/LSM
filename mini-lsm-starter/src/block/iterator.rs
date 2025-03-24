@@ -1,9 +1,9 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::sync::Arc;
+use std::{result, sync::Arc};
 
-use crate::key::{KeySlice, KeyVec};
+use crate::key::{KeySlice, KeyVec, TS_DEFAULT};
 
 use super::Block;
 
@@ -24,7 +24,10 @@ pub struct BlockIterator {
 impl BlockIterator {
     fn new(block: Arc<Block>) -> Self {
         let first_key_len = ((block.data[2] as u16) << 8) | (block.data[3] as u16);
-        let first_key = KeyVec::from_vec(block.data[4..(4 + first_key_len as usize)].to_vec());
+        let first_key = KeyVec::from_vec_with_ts(
+            block.data[4..(4 + first_key_len as usize)].to_vec(),
+            TS_DEFAULT,
+        );
         Self {
             block,
             key: KeyVec::new(),
@@ -50,7 +53,7 @@ impl BlockIterator {
 
     /// Returns the key of the current entry.
     pub fn key(&self) -> KeySlice {
-        KeySlice::from_slice(self.key.key_ref())
+        KeySlice::from_slice(self.key.key_ref(), TS_DEFAULT)
     }
 
     /// Returns the value of the current entry.
@@ -115,23 +118,21 @@ impl BlockIterator {
         entries_range_start += 2;
         let rest_key_len = self.get_u16_at(entries_range_start);
         entries_range_start += 2;
-        self.key = KeyVec::from_vec(
+        let rest_key =
+            &self.block.data[entries_range_start..entries_range_start + rest_key_len as usize];
+        entries_range_start += rest_key_len as usize;
+        let ts = self.get_u64_at(entries_range_start);
+        entries_range_start += 8;
+        self.key = KeyVec::from_vec_with_ts(
             self.first_key
                 .key_ref()
                 .iter()
                 .take(overlap_size as usize)
-                .chain(
-                    self.block.data
-                        [entries_range_start..entries_range_start + rest_key_len as usize]
-                        .iter(),
-                )
+                .chain(rest_key.iter())
                 .cloned()
                 .collect(),
+            ts,
         );
-        entries_range_start += rest_key_len as usize;
-        let ts = self.get_u64_at(entries_range_start);
-        self.key.set_ts(ts);
-        entries_range_start += 8;
         let value_len = self.get_u16_at(entries_range_start);
         entries_range_start += 2;
         let entries_range_end = entries_range_start + value_len as usize;
@@ -145,18 +146,19 @@ impl BlockIterator {
         entries_range_start += 2;
         let rest_key_len = self.get_u16_at(entries_range_start);
         entries_range_start += 2;
-        KeyVec::from_vec(
+        let rest_key =
+            &self.block.data[entries_range_start..entries_range_start + rest_key_len as usize];
+        entries_range_start += rest_key_len as usize;
+        let ts = self.get_u64_at(entries_range_start);
+        KeyVec::from_vec_with_ts(
             self.first_key
                 .key_ref()
                 .iter()
                 .take(overlap_size as usize)
-                .chain(
-                    self.block.data
-                        [entries_range_start..entries_range_start + rest_key_len as usize]
-                        .iter(),
-                )
+                .chain(rest_key.iter())
                 .cloned()
                 .collect(),
+            ts,
         )
     }
 

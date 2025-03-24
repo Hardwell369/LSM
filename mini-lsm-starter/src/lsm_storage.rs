@@ -21,11 +21,11 @@ use crate::compact::{
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::StorageIterator;
 use crate::iterators::{merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator};
-use crate::key::KeySlice;
+use crate::key::{KeySlice, TS_DEFAULT};
 use crate::key::{TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
-use crate::mem_table::{map_key_bound_with_ts, MemTable};
+use crate::mem_table::{map_bound, map_key_bound_with_ts, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTableIterator};
 use crate::table::{SsTable, SsTableBuilder};
@@ -549,7 +549,9 @@ impl LsmStorageInner {
         }
         // 确定不需要freeze memtable后，再次获取读锁，执行put操作
         let state = self.state.read();
-        state.memtable.put(_key, _value)
+        state
+            .memtable
+            .put(KeySlice::from_slice(_key, TS_RANGE_BEGIN), _value)
     }
 
     fn get_approximate_size(&self) -> usize {

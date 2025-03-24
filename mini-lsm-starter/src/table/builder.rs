@@ -30,8 +30,8 @@ impl SsTableBuilder {
     pub fn new(block_size: usize) -> Self {
         Self {
             builder: BlockBuilder::new(block_size),
-            first_key: vec![],
-            last_key: vec![],
+            first_key: KeyVec::new(),
+            last_key: KeyVec::new(),
             data: vec![],
             meta: vec![],
             hash_keys: vec![],
@@ -49,8 +49,9 @@ impl SsTableBuilder {
         }
 
         if !self.builder.add(key, value) {
-            self.split_block();
+            self.finish_block();
             let _ = self.builder.add(key, value);
+            self.first_key.set_from_slice(key);
         }
 
         self.last_key.set_from_slice(key);
@@ -72,9 +73,9 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
-        // Split the last block
+        // Finish the last block
         if !self.builder.is_empty() {
-            self.split_block();
+            self.finish_block();
         }
         // SST File: data blocks (each block end with checksum[u32]) | meta blocks | block meta offset(u32) | bloom filter | bloom filter offset(u32)
         /* data blocks */
@@ -97,26 +98,24 @@ impl SsTableBuilder {
 
         Ok(SsTable {
             file,
-            block_meta: self.meta,
             block_meta_offset,
             id,
             block_cache,
-            first_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.first_key)),
-            last_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.last_key)),
+            first_key: self.meta.first().unwrap().first_key.clone(),
+            last_key: self.meta.last().unwrap().last_key.clone(),
+            block_meta: self.meta,
             bloom: Some(bloom_filter),
             max_ts: 0,
         })
     }
 
-    fn split_block(&mut self) {
-        let first_key = self.builder.first_key();
-        let last_key = self.builder.last_key();
+    fn finish_block(&mut self) {
         let block =
             std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size)).build();
         self.meta.push(BlockMeta {
             offset: self.data.len(),
-            first_key: KeyBytes::from_bytes(first_key),
-            last_key: KeyBytes::from_bytes(last_key),
+            first_key: std::mem::take(&mut self.first_key).into_key_bytes(),
+            last_key: std::mem::take(&mut self.last_key).into_key_bytes(),
         });
         self.data.extend_from_slice(&block.encode());
     }

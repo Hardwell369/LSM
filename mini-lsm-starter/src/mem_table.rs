@@ -26,6 +26,14 @@ pub struct MemTable {
 }
 
 /// Create a bound of `Bytes` from a bound of `&[u8]`.
+pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
+    match bound {
+        Bound::Included(x) => Bound::Included(Bytes::copy_from_slice(x)),
+        Bound::Excluded(x) => Bound::Excluded(Bytes::copy_from_slice(x)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
 pub(crate) fn map_key_bound(bound: Bound<KeySlice>) -> Bound<KeyBytes> {
     match bound {
         Bound::Included(x) => Bound::Included(KeyBytes::from_bytes_with_ts(
@@ -94,14 +102,18 @@ impl MemTable {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> MemTableIterator {
-        self.scan(lower, upper)
+        self.scan(
+            map_key_bound_with_ts(lower, TS_DEFAULT),
+            map_key_bound_with_ts(upper, TS_DEFAULT),
+        )
     }
 
     /// Get a value by key.
     pub fn get(&self, _key: KeySlice) -> Option<Bytes> {
-        let key = KeyBytes::from_bytes_with_ts(Bytes::from_static(unsafe {
-            std::mem::transmute(_key.key_ref())
-        }));
+        let key = KeyBytes::from_bytes_with_ts(
+            Bytes::from_static(unsafe { std::mem::transmute(_key.key_ref()) }),
+            _key.ts(),
+        );
         match self.map.get(&key) {
             Some(entry) => Some(entry.value().clone()),
             None => None,
@@ -142,7 +154,7 @@ impl MemTable {
     }
 
     /// Get an iterator over a range of keys.
-    pub fn scan(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> MemTableIterator {
+    pub fn scan(&self, _lower: Bound<KeySlice>, _upper: Bound<KeySlice>) -> MemTableIterator {
         let (lower, upper) = (map_key_bound(_lower), map_key_bound(_upper));
         let mut iter = MemTableIteratorBuilder {
             map: self.map.clone(),
@@ -224,7 +236,7 @@ impl StorageIterator for MemTableIterator {
             let next = iter.next();
             match next {
                 Some(entry) => (entry.key().clone(), entry.value().clone()),
-                None => (Bytes::new(), Bytes::new()),
+                None => (KeyBytes::new(), Bytes::new()),
             }
         });
         self.with_item_mut(|item| {
